@@ -1,0 +1,269 @@
+package Comunication;
+
+import Interfaces.IEmailEventListener;
+import java.io.BufferedReader;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.security.sasl.AuthenticationException;
+import Utils.Command;
+import Utils.Email;
+import Utils.Extractor;
+
+import Database.ConfigEmailServer;
+
+public class MailVerificationThread implements Runnable {
+
+    private final static int PORT_POP = Integer.parseInt(ConfigEmailServer.getPortPop());
+    private final static String HOST = ConfigEmailServer.getHost();
+    private final static String USER = ConfigEmailServer.USER;
+    private final static String PASSWORD = ConfigEmailServer.PASSWORD;
+
+    private final static int CONNECT_TIMEOUT_MS = 5000;
+    private final static int LOOP_DELAY_MS = 5000;
+
+    /*
+     * Cambia a true solo cuando quieras depurar.
+     * En false no imprimirÃ¡ conexion establecida, conexion cerrada,
+     * cantidad de correos ni estado del hilo a cada rato.
+     */
+    private final static boolean DEBUG = false;
+
+    private Socket socket;
+    private BufferedReader input;
+    private DataOutputStream output;
+
+    private IEmailEventListener emailEventListener;
+
+    public IEmailEventListener getEmailEventListener() {
+        return emailEventListener;
+    }
+
+    public void setEmailEventListener(IEmailEventListener emailEventListener) {
+        this.emailEventListener = emailEventListener;
+    }
+
+    public MailVerificationThread() {
+        socket = null;
+        input = null;
+        output = null;
+    }
+
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                List<Email> emails = null;
+
+                socket = openSocket(HOST, PORT_POP, CONNECT_TIMEOUT_MS);
+                input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                output = new DataOutputStream(socket.getOutputStream());
+
+                debug("Conexion POP3 establecida");
+                logProtocol("POP3", "S", "conexion establecida con " + HOST + ":" + PORT_POP);
+
+                authUser(USER, PASSWORD);
+
+                int count = getEmailCount();
+
+                if (count > 0) {
+                    emails = getEmails(count);
+                    debug("Correos encontrados: " + count);
+                    logProtocol("POP3", "S", "STAT -> " + count + " mensaje(s)");
+                    deleteEmails(count);
+                }
+
+                String quit = Command.quit();
+                sendCommand("POP3", quit);
+                readResponse("POP3");
+
+                cerrarConexionPop3();
+
+                debug("Conexion POP3 cerrada");
+                logProtocol("POP3", "I", "sesion POP3 cerrada normalmente; nuevo sondeo en "
+                        + (LOOP_DELAY_MS / 1000) + " segundos");
+
+                if (count > 0 && emailEventListener != null) {
+                    emailEventListener.onReceiveEmailEvent(emails);
+                }
+
+                Thread.sleep(LOOP_DELAY_MS);
+
+            } catch (IOException ex) {
+                Logger.getLogger(MailVerificationThread.class.getName()).log(Level.SEVERE, null, ex);
+                logProtocol("POP3", "!", "error de comunicacion: " + ex.getMessage());
+                cerrarConexionPop3();
+                safeSleep(LOOP_DELAY_MS);
+
+            } catch (LinkageError error) {
+                logProtocol("POP3", "!", "dependencia de ejecucion faltante: "
+                        + error.getMessage());
+                logProtocol("POP3", "!", "Verifica incluir las librerias necesarias (javax.mail.jar).");
+                cerrarConexionPop3();
+                safeSleep(LOOP_DELAY_MS);
+
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                debug("Hilo interrumpido");
+                logProtocol("POP3", "!", "hilo interrumpido");
+                break;
+
+            } catch (Exception ex) {
+                logProtocol("POP3", "!", "error procesando correo: " + ex.getMessage());
+                cerrarConexionPop3();
+                safeSleep(LOOP_DELAY_MS);
+            }
+        }
+    }
+
+    private Socket openSocket(String host, int port, int timeoutMs) throws IOException {
+        Socket s = new Socket();
+        s.connect(new InetSocketAddress(host, port), timeoutMs);
+        return s;
+    }
+
+    private void authUser(String email, String password) throws IOException {
+        if (socket != null && input != null && output != null) {
+            readResponse("POP3");
+
+            sendCommand("POP3", Command.user(email));
+            readResponse("POP3");
+
+            sendCommand("POP3", Command.pass(password));
+            String message = readResponse("POP3");
+
+            if (message.contains("-ERR")) {
+                throw new AuthenticationException();
+            }
+        }
+    }
+
+    private int getEmailCount() throws IOException {
+        String command = Command.stat();
+        sendCommand("POP3", command);
+        String line = readResponse("POP3");
+        String[] data = line.split(" ");
+
+        return Integer.parseInt(data[1]);
+    }
+
+    private List<Email> getEmails(int count) throws IOException {
+        List<Email> emails = new ArrayList<>();
+
+        for (int i = 1; i <= count; i++) {
+            sendCommand("POP3", Command.retr(i));
+
+            String text = readMultiline();
+            Email email = Extractor.getEmail(text);
+            emails.add(email);
+            logProtocol("POP3", "S", "mensaje " + i + " recibido | From: "
+                    + email.getFrom() + " | Subject: " + email.getSubject());
+        }
+
+        return emails;
+    }
+
+    private void deleteEmails(int emails) throws IOException {
+        for (int i = 1; i <= emails; i++) {
+            sendCommand("POP3", Command.dele(i));
+            readResponse("POP3");
+        }
+    }
+
+    private String readMultiline() throws IOException {
+        StringBuilder lines = new StringBuilder();
+
+        boolean firstLine = true;
+
+        while (true) {
+            String line = input.readLine();
+
+            if (line == null) {
+                throw new IOException("Servidor no responde. Ocurrio un error al abrir el correo.");
+            }
+
+            if (line.equals(".")) {
+                break;
+            }
+
+            if (!firstLine) {
+                lines.append('\n');
+            }
+
+            lines.append(line);
+            firstLine = false;
+        }
+
+        return lines.toString();
+    }
+
+    private void cerrarConexionPop3() {
+        try {
+            if (input != null) {
+                input.close();
+            }
+        } catch (IOException ignored) {
+        }
+
+        try {
+            if (output != null) {
+                output.close();
+            }
+        } catch (IOException ignored) {
+        }
+
+        try {
+            if (socket != null) {
+                socket.close();
+            }
+        } catch (IOException ignored) {
+        }
+
+        input = null;
+        output = null;
+        socket = null;
+    }
+
+    private void safeSleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void debug(String mensaje) {
+        if (DEBUG) {
+            System.out.println(mensaje);
+        }
+    }
+
+    private void sendCommand(String protocol, String command) throws IOException {
+        String visibleCommand = command.replace("\r", "").replace("\n", "");
+        if (visibleCommand.regionMatches(true, 0, "PASS ", 0, 5)) {
+            visibleCommand = "PASS ********";
+        }
+        logProtocol(protocol, "C", visibleCommand);
+        output.writeBytes(command);
+        output.flush();
+    }
+
+    private String readResponse(String protocol) throws IOException {
+        String response = input.readLine();
+        if (response == null) {
+            throw new IOException(protocol + ": el servidor cerró la conexión sin responder");
+        }
+        logProtocol(protocol, "S", response);
+        return response;
+    }
+
+    private void logProtocol(String protocol, String direction, String message) {
+        System.out.println("[" + protocol + "][" + direction + "] " + message);
+    }
+}
